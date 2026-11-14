@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Backup and restore selected Omarchy dotfiles through the GitHub Gist API."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+APP = "omarchy-C_dots"
+GIST_FILENAME = "omarchy-C_dots-backup.json"
+SCHEMA = 1
+MAX_FILE_SIZE = 1_000_000
+BLOCKED_PARTS = {
+    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
+    "credentials", "credential", "secrets", "secret", "tokens", "token",
+}
+BLOCKED_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+
+
+class AppError(Exception):
+    pass
+
+
+def paths(config_dir: Path) -> tuple[Path, Path]:
+    return config_dir / "config.json", config_dir / "manifest.json"
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AppError(f"Não foi possível ler {path}: {exc}") from exc
+
+
+def save_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    temp.replace(path)
+
+
+def run_gh(args: list[str], payload: dict | None = None) -> str:
+    cmd = ["gh", "api", *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=json.dumps(payload) if payload is not None else None,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AppError("GitHub CLI (gh) não está instalado.") from exc
+    if proc.returncode:
+        message = proc.stderr.strip() or "erro sem detalhes"
+        if "authentication" in message.lower() or "401" in message:
+            message += "\nAutentique novamente com: gh auth login"
+        raise AppError(f"Falha no GitHub: {message}")
+    return proc.stdout
+
+
+def relative_home_path(raw: str) -> tuple[str, Path]:
+    home = Path.home().resolve()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = home / candidate
+    resolved = candidate.resolve(strict=False)
+    try:
+        rel = resolved.relative_to(home).as_posix()
+    except ValueError as exc:
+        raise AppError("O arquivo precisa estar dentro do seu HOME.") from exc
+    parts = {part.lower() for part in Path(rel).parts}
+    if parts & BLOCKED_PARTS or Path(rel).suffix.lower() in BLOCKED_SUFFIXES:
+        raise AppError("Este caminho parece conter credenciais ou dados sensíveis e foi bloqueado.")
+    if candidate.is_symlink():
+        raise AppError("Links simbólicos não são aceitos; informe o arquivo de destino explicitamente.")
+    return rel, home / rel
+
+
+def read_manifest(manifest_file: Path) -> list[str]:
+    entries = load_json(manifest_file, [])
+    if not isinstance(entries, list) or any(not isinstance(item, str) for item in entries):
+        raise AppError(f"Manifesto inválido: {manifest_file}")
+    return sorted(set(entries))
+
+
+def collect_files(entries: list[str]) -> dict[str, str]:
+    result = {}
+    for entry in entries:
+        rel, file_path = relative_home_path(entry)
+        if not file_path.exists():
+            print(f"Aviso: ignorando arquivo ausente: ~/{rel}", file=sys.stderr)
+            continue
+        if not file_path.is_file():
+            raise AppError(f"Não é um arquivo regular: ~/{rel}")
+        if file_path.stat().st_size > MAX_FILE_SIZE:
+            raise AppError(f"Arquivo maior que 1 MB: ~/{rel}")
+        try:
+            result[rel] = file_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            raise AppError(f"Arquivo não é texto UTF-8 legível: ~/{rel}") from exc
+    if not result:
+        raise AppError("Nenhum arquivo do manifesto existe para backup.")
+    return result
+
+
+def parse_gist(stdout: str) -> dict:
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise AppError("A resposta do GitHub não era JSON válido.") from exc
+
+
+def cmd_manifest(args, config_dir: Path) -> None:
+    _, manifest_file = paths(config_dir)
+    entries = read_manifest(manifest_file)
+    if args.action == "list":
+        if not entries:
+            print("Manifesto vazio. Adicione arquivos com: omarchy-C_dots manifest add CAMINHO")
+        for entry in entries:
+            print(f"~/{entry}")
+        return
+    rel, _ = relative_home_path(args.path)
+    if args.action == "add":
+        if rel not in entries:
+            entries.append(rel)
+            save_json(manifest_file, sorted(entries))
+            print(f"Adicionado: ~/{rel}")
+        else:
+            print(f"Já está no manifesto: ~/{rel}")
+    else:
+        if rel not in entries:
+            raise AppError(f"Não está no manifesto: ~/{rel}")
+        entries.remove(rel)
+        save_json(manifest_file, entries)
+        print(f"Removido: ~/{rel}")
+
+
+def cmd_setup(args, config_dir: Path) -> None:
+    config_file, _ = paths(config_dir)
+    config = load_json(config_file, {})
+    if args.gist:
+        config["gist_id"] = args.gist.rstrip("/").split("/")[-1]
+        save_json(config_file, config)
+        print(f"Gist associado: {config['gist_id']}")
+        return
+    user = parse_gist(run_gh(["/user"]))
+    login = user.get("login", "usuário GitHub")
+    print(f"Autenticado como {login}. Vou criar um Gist secreto (acessível a quem tiver o link).")
+    if not args.yes and input("Criar o Gist agora? [s/N] ").strip().lower() not in {"s", "sim", "y", "yes"}:
+        print("Cancelado; nenhum Gist foi criado.")
+        return
+    body = {
+        "description": "Backup de dotfiles Omarchy criado por omarchy-C_dots",
+        "public": False,
+        "files": {GIST_FILENAME: {"content": json.dumps({"schema": SCHEMA, "files": {}}, ensure_ascii=False)}},
+    }
+    gist = parse_gist(run_gh(["--method", "POST", "/gists", "--input", "-"], body))
+    config.update({"gist_id": gist["id"], "gist_url": gist.get("html_url"), "github_login": login})
+    save_json(config_file, config)
+    print(f"Gist criado e associado: {gist.get('html_url', gist['id'])}")
+
+
+def make_payload(files: dict[str, str]) -> dict:
+    return {
+        "schema": SCHEMA,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "files": files,
+    }
+
+
+def cmd_backup(args, config_dir: Path) -> None:
+    config_file, manifest_file = paths(config_dir)
+    files = collect_files(read_manifest(manifest_file))
+    payload = make_payload(files)
+    print(f"Arquivos selecionados ({len(files)}):")
+    for name in files:
+        print(f"  ~/{name}")
+    if args.dry_run:
+        print("Prévia concluída: nada foi enviado ao GitHub.")
+        return
+    config = load_json(config_file, {})
+    gist_id = config.get("gist_id")
+    if not gist_id:
+        raise AppError("Gist não configurado. Execute primeiro: omarchy-C_dots setup")
+    body = {"files": {GIST_FILENAME: {"content": json.dumps(payload, ensure_ascii=False)}}}
+    gist = parse_gist(run_gh(["--method", "PATCH", f"/gists/{gist_id}", "--input", "-"], body))
+    config["last_backup"] = payload["updated_at"]
+    config["gist_url"] = gist.get("html_url", config.get("gist_url"))
+    save_json(config_file, config)
+    print(f"Backup atualizado: {config.get('gist_url', gist_id)}")
+
+
+def cmd_restore(args, config_dir: Path) -> None:
+    config_file, _ = paths(config_dir)
+    config = load_json(config_file, {})
+    gist_id = args.gist or config.get("gist_id")
+    if not gist_id:
+        raise AppError("Gist não configurado. Execute setup ou informe --gist ID.")
+    gist = parse_gist(run_gh([f"/gists/{gist_id}"]))
+    gist_file = gist.get("files", {}).get(GIST_FILENAME)
+    if not gist_file:
+        raise AppError(f"O Gist não contém {GIST_FILENAME}.")
+    try:
+        payload = json.loads(gist_file["content"])
+        files = payload["files"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise AppError("O conteúdo do Gist não corresponde a um backup válido.") from exc
+    plan = []
+    for name, content in files.items():
+        rel, destination = relative_home_path(name)
+        if not isinstance(content, str):
+            raise AppError(f"Conteúdo inválido para ~/{rel}")
+        plan.append((rel, destination, content))
+    print(f"Arquivos no backup ({len(plan)}):")
+    for rel, destination, _ in plan:
+        marker = " (será sobrescrito)" if destination.exists() else " (novo arquivo)"
+        print(f"  ~/{rel}{marker}")
+    if args.dry_run:
+        print("Prévia concluída: nenhum arquivo foi alterado.")
+        return
+    if not args.yes and input("Restaurar esses arquivos? [s/N] ").strip().lower() not in {"s", "sim", "y", "yes"}:
+        print("Cancelado; nenhum arquivo foi alterado.")
+        return
+    for rel, destination, content in plan:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise AppError(f"Recusando sobrescrever link simbólico: ~/{rel}")
+        if destination.exists():
+            backup = destination.with_name(destination.name + ".omarchy-C_dots.bak")
+            if not backup.exists():
+                backup.write_bytes(destination.read_bytes())
+        destination.write_text(content, encoding="utf-8")
+        print(f"Restaurado: ~/{rel}")
+
+
+def cmd_status(config_dir: Path) -> None:
+    config_file, manifest_file = paths(config_dir)
+    config = load_json(config_file, {})
+    entries = read_manifest(manifest_file)
+    print(f"Manifesto: {len(entries)} arquivo(s)")
+    if config.get("gist_id"):
+        print(f"Gist: {config.get('gist_url', config['gist_id'])}")
+    else:
+        print("Gist: não configurado")
+    print(f"Último backup: {config.get('last_backup', 'nunca')}")
+    proc = subprocess.run(["gh", "auth", "status"], text=True, capture_output=True, check=False)
+    if proc.returncode == 0:
+        print("GitHub CLI: autenticado")
+    else:
+        print("GitHub CLI: não autenticado ou token inválido")
+        if proc.stderr.strip():
+            print(proc.stderr.strip())
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog=APP, description="Backup/restauração de dotfiles via GitHub Gist")
+    parser.add_argument("--config-dir", type=Path, help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="Mostra configuração e data do backup")
+    setup = sub.add_parser("setup", help="Autentica e cria ou associa um Gist")
+    setup.add_argument("--gist", help="Associa um Gist existente pelo ID ou URL")
+    setup.add_argument("--yes", action="store_true", help="Confirma a criação do Gist")
+    manifest = sub.add_parser("manifest", help="Gerencia os arquivos incluídos no backup")
+    manifest_sub = manifest.add_subparsers(dest="action", required=True)
+    manifest_sub.add_parser("list", help="Lista os caminhos selecionados")
+    for action in ("add", "remove"):
+        item = manifest_sub.add_parser(action)
+        item.add_argument("path", help="Caminho dentro do HOME")
+    backup = sub.add_parser("backup", help="Atualiza o Gist com os arquivos selecionados")
+    backup.add_argument("--dry-run", action="store_true", help="Mostra o que seria enviado sem enviar")
+    restore = sub.add_parser("restore", help="Restaura os arquivos do Gist")
+    restore.add_argument("--gist", help="ID/URL de outro Gist")
+    restore.add_argument("--dry-run", action="store_true", help="Mostra o que seria restaurado")
+    restore.add_argument("--yes", action="store_true", help="Não pergunta antes de aplicar")
+    args = parser.parse_args()
+    config_dir = args.config_dir or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+    try:
+        if args.command == "manifest":
+            cmd_manifest(args, config_dir)
+        elif args.command == "setup":
+            cmd_setup(args, config_dir)
+        elif args.command == "backup":
+            cmd_backup(args, config_dir)
+        elif args.command == "restore":
+            cmd_restore(args, config_dir)
+        else:
+            cmd_status(config_dir)
+    except AppError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
