@@ -15,11 +15,16 @@ APP = "omarchy-C_dots"
 GIST_FILENAME = "omarchy-C_dots-backup.json"
 SCHEMA = 1
 MAX_FILE_SIZE = 1_000_000
+MAX_GIST_PAYLOAD = 900_000
 BLOCKED_PARTS = {
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
     "credentials", "credential", "secrets", "secret", "tokens", "token", "auth",
 }
 BLOCKED_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+SKIP_DIRECTORY_NAMES = {
+    ".git", "cache", "caches", ".cache", "node_modules", "__pycache__",
+    ".venv", "venv", "sessions",
+}
 
 
 class AppError(Exception):
@@ -107,17 +112,46 @@ def collect_files(entries: list[str]) -> dict[str, str]:
         if not file_path.exists():
             print(f"Aviso: ignorando arquivo ausente: ~/{rel}", file=sys.stderr)
             continue
-        if not file_path.is_file():
-            raise AppError(f"Não é um arquivo regular: ~/{rel}")
-        if file_path.stat().st_size > MAX_FILE_SIZE:
-            raise AppError(f"Arquivo maior que 1 MB: ~/{rel}")
-        try:
-            result[rel] = file_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError) as exc:
-            raise AppError(f"Arquivo não é texto UTF-8 legível: ~/{rel}") from exc
+        if file_path.is_dir():
+            if not rel.startswith(".config/"):
+                raise AppError("Para incluir pastas, escolha uma subpasta específica dentro de ~/.config.")
+            for root, dirs, names in os.walk(file_path, topdown=True, followlinks=False):
+                root_path = Path(root)
+                dirs[:] = sorted(
+                    name for name in dirs
+                    if name.lower() not in SKIP_DIRECTORY_NAMES
+                    and name.lower() not in BLOCKED_PARTS
+                    and not (root_path / name).is_symlink()
+                )
+                for name in sorted(names):
+                    candidate = root_path / name
+                    if candidate.is_symlink() or not candidate.is_file():
+                        continue
+                    add_file(result, candidate)
+        elif file_path.is_file():
+            add_file(result, file_path)
+        else:
+            raise AppError(f"Não é um arquivo regular nem uma pasta: ~/{rel}")
     if not result:
         raise AppError("Nenhum arquivo do manifesto existe para backup.")
     return result
+
+
+def add_file(result: dict[str, str], file_path: Path) -> None:
+    try:
+        rel, safe_path = relative_home_path(str(file_path))
+    except AppError as exc:
+        print(f"Aviso: ignorando {file_path.name}: {exc}", file=sys.stderr)
+        return
+    if safe_path.stat().st_size > MAX_FILE_SIZE:
+        print(f"Aviso: ignorando arquivo maior que 1 MB: ~/{rel}", file=sys.stderr)
+        return
+    try:
+        result[rel] = safe_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        print(f"Aviso: ignorando arquivo binário ou fora de UTF-8: ~/{rel}", file=sys.stderr)
+    except OSError as exc:
+        raise AppError(f"Não foi possível ler ~/{rel}: {exc}") from exc
 
 
 def parse_gist(stdout: str) -> dict:
@@ -134,14 +168,20 @@ def cmd_manifest(args, config_dir: Path) -> None:
         if not entries:
             print("Manifesto vazio. Adicione arquivos com: omarchy-C_dots manifest add CAMINHO")
         for entry in entries:
-            print(f"~/{entry}")
+            path = Path.home() / entry
+            suffix = "/ (recursivo)" if path.is_dir() else ""
+            print(f"~/{entry}{suffix}")
         return
     rel, _ = relative_home_path(args.path)
     if args.action == "add":
+        selected = Path.home().joinpath(rel)
+        if selected.is_dir() and not rel.startswith(".config/"):
+            raise AppError("Para incluir uma pasta, escolha uma subpasta específica dentro de ~/.config.")
         if rel not in entries:
             entries.append(rel)
             save_json(manifest_file, sorted(entries))
-            print(f"Adicionado: ~/{rel}")
+            suffix = "/ (recursivo)" if selected.is_dir() else ""
+            print(f"Adicionado: ~/{rel}{suffix}")
         else:
             print(f"Já está no manifesto: ~/{rel}")
     else:
@@ -194,12 +234,17 @@ def cmd_backup(args, config_dir: Path) -> None:
         print(f"  ~/{name}")
     if args.dry_run:
         print("Prévia concluída: nada foi enviado ao GitHub.")
+        payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        print(f"Tamanho aproximado do pacote: {payload_size:,} bytes")
         return
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    if len(payload_text.encode("utf-8")) > MAX_GIST_PAYLOAD:
+        raise AppError("O pacote passou de 900 KB. Remova arquivos do manifesto para caber em um único Gist.")
     config = load_json(config_file, {})
     gist_id = config.get("gist_id")
     if not gist_id:
         raise AppError("Gist não configurado. Execute primeiro: omarchy-C_dots setup")
-    body = {"files": {GIST_FILENAME: {"content": json.dumps(payload, ensure_ascii=False)}}}
+    body = {"files": {GIST_FILENAME: {"content": payload_text}}}
     gist = parse_gist(run_gh(["--method", "PATCH", f"/gists/{gist_id}", "--input", "-"], body))
     config["last_backup"] = payload["updated_at"]
     config["gist_url"] = gist.get("html_url", config.get("gist_url"))
