@@ -6,8 +6,8 @@ O diagrama mostra o MVP planejado. A ferramenta roda localmente, usa a autentica
 flowchart TD
     U[Usuário] -->|setup / autenticar| CLI[omarchy-C_dots CLI]
     CLI -->|usa credencial local| GH[GitHub CLI: gh auth]
-    CLI -->|lê caminhos permitidos| M[Manifesto de dotfiles]
-    M -->|seleciona arquivos| FS[(Arquivos locais<br/>~/.config e HOME)]
+    CLI -->|lê caminhos permitidos| M[Manifesto de arquivos e pastas]
+    M -->|expande pastas de .config recursivamente| FS[(Arquivos locais<br/>~/.config e HOME)]
 
     U -->|backup manual| CLI
     CLI -->|valida manifesto e exclui caminhos sensíveis| SAFE[Coleta segura]
@@ -32,6 +32,9 @@ flowchart TD
 - Backup manual por padrão; timer semanal é opt-in.
 - Um Gist por usuário, associado localmente após autenticação.
 - O manifesto lista caminhos relativos ao `HOME`; não varrer `~/.config` inteiro.
+- Entradas podem ser arquivos individuais ou subpastas específicas de `~/.config`; pastas são percorridas recursivamente.
+- Não seguir links simbólicos; pular caches, sessões, dependências e diretórios Git.
+- Limitar o pacote completo a 900 KB para caber em um único arquivo do Gist.
 - Excluir segredos, tokens, caches, arquivos de sessão, binários e configurações específicas de hardware por padrão.
 - Avisar que Gist secreto é acessível a qualquer pessoa que obtenha o link.
 - Mostrar os arquivos que serão sobrescritos e pedir confirmação antes de restaurar.
