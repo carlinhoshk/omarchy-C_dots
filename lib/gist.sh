@@ -24,8 +24,7 @@ dots_setup() {
   user="$(jq -r '.login // "usuário GitHub"' <<< "$user")"
   printf 'Autenticado como %s. Será criado um Gist secreto, acessível a quem tiver o link.\n' "$user"
   if [[ "${answer:-}" != yes ]]; then
-    read -r -p 'Criar o Gist agora? [s/N] ' answer || true
-    [[ "${answer,,}" == s || "${answer,,}" == sim ]] || { printf 'Cancelado; nenhum Gist foi criado.\n'; return; }
+    confirm_yn 'Criar o Gist agora?' || { printf 'Cancelado; nenhum Gist foi criado.\n'; return; }
   fi
   body="$(jq -n --arg filename "$GIST_FILENAME" \
     --arg content '{"schema":1,"files":{}}' \

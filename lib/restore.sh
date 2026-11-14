@@ -2,7 +2,7 @@
 
 dots_restore() {
   local gist_arg="" dry_run=no auto_yes=no config gist_id workdir response payload
-  local rel dest marker backup tmp stamp answer
+  local rel dest marker backup tmp stamp
   while (($#)); do
     case "$1" in
       --gist) (($# >= 2)) || die "--gist precisa de um ID ou URL"; gist_arg="$2"; shift 2 ;;
@@ -38,8 +38,7 @@ dots_restore() {
     return
   fi
   if [[ "$auto_yes" != yes ]]; then
-    read -r -p 'Restaurar esses arquivos? [s/N] ' answer || true
-    [[ "${answer,,}" == s || "${answer,,}" == sim ]] || { printf 'Cancelado; nenhum arquivo foi alterado.\n'; return; }
+    confirm_yn 'Restaurar esses arquivos?' || { printf 'Cancelado; nenhum arquivo foi alterado.\n'; return; }
   fi
 
   while IFS= read -r -d '' rel; do

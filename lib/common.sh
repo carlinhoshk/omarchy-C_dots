@@ -12,6 +12,18 @@ APP_TEMP_DIRS=()
 die() { printf 'Erro: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'Aviso: %s\n' "$*" >&2; }
 
+confirm_yn() {
+  local prompt="$1" answer
+  while true; do
+    read -r -p "$prompt [y/n] " answer || return 1
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) printf 'Digite y para sim ou n para não.\n' >&2 ;;
+    esac
+  done
+}
+
 register_temp_dir() { APP_TEMP_DIRS+=("$1"); }
 
 cleanup_temp_dirs() {
