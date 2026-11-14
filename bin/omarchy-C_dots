@@ -1,357 +1,44 @@
-#!/usr/bin/env python3
-"""Backup and restore selected Omarchy dotfiles through the GitHub Gist API."""
+#!/usr/bin/env bash
+set -euo pipefail
 
-from __future__ import annotations
+APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+LIB_DIR="$APP_DIR/lib"
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/manifest.sh"
+source "$LIB_DIR/gist.sh"
+source "$LIB_DIR/backup.sh"
+source "$LIB_DIR/restore.sh"
+trap cleanup_temp_dirs EXIT
 
-import argparse
-import json
-import os
-import subprocess
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
+usage() {
+  cat <<'EOF'
+Uso: omarchy-C_dots <comando> [opções]
 
-APP = "omarchy-C_dots"
-GIST_FILENAME = "omarchy-C_dots-backup.json"
-SCHEMA = 1
-MAX_FILE_SIZE = 1_000_000
-MAX_GIST_PAYLOAD = 900_000
-BLOCKED_PARTS = {
-    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
-    "credentials", "credential", "secrets", "secret", "tokens", "token", "auth",
+Comandos:
+  status                 Mostra autenticação, manifesto e backup recente
+  setup [--gist ID|URL]  Cria ou associa um Gist
+  manifest list          Lista arquivos e pastas selecionados
+  manifest add CAMINHO   Inclui arquivo ou pasta específica de ~/.config
+  manifest remove CAMINHO
+  backup [--dry-run]     Atualiza o Gist ou apenas mostra a prévia
+  restore [--gist ID] [--dry-run] [--yes]
+
+As pastas do manifesto são percorridas recursivamente.
+EOF
 }
-BLOCKED_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
-SKIP_DIRECTORY_NAMES = {
-    ".git", "cache", "caches", ".cache", "node_modules", "__pycache__",
-    ".venv", "venv", "sessions",
-}
 
-
-class AppError(Exception):
-    pass
-
-
-def paths(config_dir: Path) -> tuple[Path, Path]:
-    return config_dir / "config.json", config_dir / "manifest.json"
-
-
-def load_json(path: Path, default):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return default
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AppError(f"Não foi possível ler {path}: {exc}") from exc
-
-
-def save_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(temp, 0o600)
-    temp.replace(path)
-
-
-def run_gh(args: list[str], payload: dict | None = None) -> str:
-    cmd = ["gh", "api", *args]
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=json.dumps(payload) if payload is not None else None,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise AppError("GitHub CLI (gh) não está instalado.") from exc
-    if proc.returncode:
-        message = proc.stderr.strip() or "erro sem detalhes"
-        if "authentication" in message.lower() or "401" in message:
-            message += "\nAutentique novamente com: gh auth login"
-        raise AppError(f"Falha no GitHub: {message}")
-    return proc.stdout
-
-
-def relative_home_path(raw: str) -> tuple[str, Path]:
-    home = Path.home().resolve()
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        candidate = home / candidate
-    lexical = Path(os.path.abspath(candidate))
-    try:
-        lexical_rel = lexical.relative_to(home)
-    except ValueError as exc:
-        raise AppError("O arquivo precisa estar dentro do seu HOME.") from exc
-    current = home
-    for part in lexical_rel.parts:
-        current /= part
-        if current.is_symlink():
-            raise AppError("Links simbólicos não são aceitos; informe o arquivo de destino explicitamente.")
-    resolved = candidate.resolve(strict=False)
-    try:
-        rel = resolved.relative_to(home).as_posix()
-    except ValueError as exc:
-        raise AppError("O arquivo precisa estar dentro do seu HOME.") from exc
-    parts = {part.lower() for part in Path(rel).parts}
-    if parts & BLOCKED_PARTS or Path(rel).suffix.lower() in BLOCKED_SUFFIXES:
-        raise AppError("Este caminho parece conter credenciais ou dados sensíveis e foi bloqueado.")
-    return rel, home / rel
-
-
-def read_manifest(manifest_file: Path) -> list[str]:
-    entries = load_json(manifest_file, [])
-    if not isinstance(entries, list) or any(not isinstance(item, str) for item in entries):
-        raise AppError(f"Manifesto inválido: {manifest_file}")
-    return sorted(set(entries))
-
-
-def collect_files(entries: list[str]) -> dict[str, str]:
-    result = {}
-    for entry in entries:
-        rel, file_path = relative_home_path(entry)
-        if not file_path.exists():
-            print(f"Aviso: ignorando arquivo ausente: ~/{rel}", file=sys.stderr)
-            continue
-        if file_path.is_dir():
-            if not rel.startswith(".config/"):
-                raise AppError("Para incluir pastas, escolha uma subpasta específica dentro de ~/.config.")
-            for root, dirs, names in os.walk(file_path, topdown=True, followlinks=False):
-                root_path = Path(root)
-                dirs[:] = sorted(
-                    name for name in dirs
-                    if name.lower() not in SKIP_DIRECTORY_NAMES
-                    and name.lower() not in BLOCKED_PARTS
-                    and not (root_path / name).is_symlink()
-                )
-                for name in sorted(names):
-                    candidate = root_path / name
-                    if candidate.is_symlink() or not candidate.is_file():
-                        continue
-                    add_file(result, candidate)
-        elif file_path.is_file():
-            add_file(result, file_path)
-        else:
-            raise AppError(f"Não é um arquivo regular nem uma pasta: ~/{rel}")
-    if not result:
-        raise AppError("Nenhum arquivo do manifesto existe para backup.")
-    return result
-
-
-def add_file(result: dict[str, str], file_path: Path) -> None:
-    try:
-        rel, safe_path = relative_home_path(str(file_path))
-    except AppError as exc:
-        print(f"Aviso: ignorando {file_path.name}: {exc}", file=sys.stderr)
-        return
-    if safe_path.stat().st_size > MAX_FILE_SIZE:
-        print(f"Aviso: ignorando arquivo maior que 1 MB: ~/{rel}", file=sys.stderr)
-        return
-    try:
-        result[rel] = safe_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        print(f"Aviso: ignorando arquivo binário ou fora de UTF-8: ~/{rel}", file=sys.stderr)
-    except OSError as exc:
-        raise AppError(f"Não foi possível ler ~/{rel}: {exc}") from exc
-
-
-def parse_gist(stdout: str) -> dict:
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise AppError("A resposta do GitHub não era JSON válido.") from exc
-
-
-def cmd_manifest(args, config_dir: Path) -> None:
-    _, manifest_file = paths(config_dir)
-    entries = read_manifest(manifest_file)
-    if args.action == "list":
-        if not entries:
-            print("Manifesto vazio. Adicione arquivos com: omarchy-C_dots manifest add CAMINHO")
-        for entry in entries:
-            path = Path.home() / entry
-            suffix = "/ (recursivo)" if path.is_dir() else ""
-            print(f"~/{entry}{suffix}")
-        return
-    rel, _ = relative_home_path(args.path)
-    if args.action == "add":
-        selected = Path.home().joinpath(rel)
-        if selected.is_dir() and not rel.startswith(".config/"):
-            raise AppError("Para incluir uma pasta, escolha uma subpasta específica dentro de ~/.config.")
-        if rel not in entries:
-            entries.append(rel)
-            save_json(manifest_file, sorted(entries))
-            suffix = "/ (recursivo)" if selected.is_dir() else ""
-            print(f"Adicionado: ~/{rel}{suffix}")
-        else:
-            print(f"Já está no manifesto: ~/{rel}")
-    else:
-        if rel not in entries:
-            raise AppError(f"Não está no manifesto: ~/{rel}")
-        entries.remove(rel)
-        save_json(manifest_file, entries)
-        print(f"Removido: ~/{rel}")
-
-
-def cmd_setup(args, config_dir: Path) -> None:
-    config_file, _ = paths(config_dir)
-    config = load_json(config_file, {})
-    if args.gist:
-        config["gist_id"] = args.gist.rstrip("/").split("/")[-1]
-        save_json(config_file, config)
-        print(f"Gist associado: {config['gist_id']}")
-        return
-    user = parse_gist(run_gh(["/user"]))
-    login = user.get("login", "usuário GitHub")
-    print(f"Autenticado como {login}. Vou criar um Gist secreto (acessível a quem tiver o link).")
-    if not args.yes and input("Criar o Gist agora? [s/N] ").strip().lower() not in {"s", "sim", "y", "yes"}:
-        print("Cancelado; nenhum Gist foi criado.")
-        return
-    body = {
-        "description": "Backup de dotfiles Omarchy criado por omarchy-C_dots",
-        "public": False,
-        "files": {GIST_FILENAME: {"content": json.dumps({"schema": SCHEMA, "files": {}}, ensure_ascii=False)}},
-    }
-    gist = parse_gist(run_gh(["--method", "POST", "/gists", "--input", "-"], body))
-    config.update({"gist_id": gist["id"], "gist_url": gist.get("html_url"), "github_login": login})
-    save_json(config_file, config)
-    print(f"Gist criado e associado: {gist.get('html_url', gist['id'])}")
-
-
-def make_payload(files: dict[str, str]) -> dict:
-    return {
-        "schema": SCHEMA,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "files": files,
-    }
-
-
-def cmd_backup(args, config_dir: Path) -> None:
-    config_file, manifest_file = paths(config_dir)
-    files = collect_files(read_manifest(manifest_file))
-    payload = make_payload(files)
-    print(f"Arquivos selecionados ({len(files)}):")
-    for name in files:
-        print(f"  ~/{name}")
-    if args.dry_run:
-        print("Prévia concluída: nada foi enviado ao GitHub.")
-        payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        print(f"Tamanho aproximado do pacote: {payload_size:,} bytes")
-        return
-    payload_text = json.dumps(payload, ensure_ascii=False)
-    if len(payload_text.encode("utf-8")) > MAX_GIST_PAYLOAD:
-        raise AppError("O pacote passou de 900 KB. Remova arquivos do manifesto para caber em um único Gist.")
-    config = load_json(config_file, {})
-    gist_id = config.get("gist_id")
-    if not gist_id:
-        raise AppError("Gist não configurado. Execute primeiro: omarchy-C_dots setup")
-    body = {"files": {GIST_FILENAME: {"content": payload_text}}}
-    gist = parse_gist(run_gh(["--method", "PATCH", f"/gists/{gist_id}", "--input", "-"], body))
-    config["last_backup"] = payload["updated_at"]
-    config["gist_url"] = gist.get("html_url", config.get("gist_url"))
-    save_json(config_file, config)
-    print(f"Backup atualizado: {config.get('gist_url', gist_id)}")
-
-
-def cmd_restore(args, config_dir: Path) -> None:
-    config_file, _ = paths(config_dir)
-    config = load_json(config_file, {})
-    gist_id = args.gist or config.get("gist_id")
-    if not gist_id:
-        raise AppError("Gist não configurado. Execute setup ou informe --gist ID.")
-    gist = parse_gist(run_gh([f"/gists/{gist_id}"]))
-    gist_file = gist.get("files", {}).get(GIST_FILENAME)
-    if not gist_file:
-        raise AppError(f"O Gist não contém {GIST_FILENAME}.")
-    try:
-        payload = json.loads(gist_file["content"])
-        files = payload["files"]
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise AppError("O conteúdo do Gist não corresponde a um backup válido.") from exc
-    plan = []
-    for name, content in files.items():
-        rel, destination = relative_home_path(name)
-        if not isinstance(content, str):
-            raise AppError(f"Conteúdo inválido para ~/{rel}")
-        plan.append((rel, destination, content))
-    print(f"Arquivos no backup ({len(plan)}):")
-    for rel, destination, _ in plan:
-        marker = " (será sobrescrito)" if destination.exists() else " (novo arquivo)"
-        print(f"  ~/{rel}{marker}")
-    if args.dry_run:
-        print("Prévia concluída: nenhum arquivo foi alterado.")
-        return
-    if not args.yes and input("Restaurar esses arquivos? [s/N] ").strip().lower() not in {"s", "sim", "y", "yes"}:
-        print("Cancelado; nenhum arquivo foi alterado.")
-        return
-    for rel, destination, content in plan:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink():
-            raise AppError(f"Recusando sobrescrever link simbólico: ~/{rel}")
-        if destination.exists():
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            backup = destination.with_name(destination.name + f".omarchy-C_dots.bak.{stamp}")
-            backup.write_bytes(destination.read_bytes())
-        destination.write_text(content, encoding="utf-8")
-        print(f"Restaurado: ~/{rel}")
-
-
-def cmd_status(config_dir: Path) -> None:
-    config_file, manifest_file = paths(config_dir)
-    config = load_json(config_file, {})
-    entries = read_manifest(manifest_file)
-    print(f"Manifesto: {len(entries)} arquivo(s)")
-    if config.get("gist_id"):
-        print(f"Gist: {config.get('gist_url', config['gist_id'])}")
-    else:
-        print("Gist: não configurado")
-    print(f"Último backup: {config.get('last_backup', 'nunca')}")
-    proc = subprocess.run(["gh", "auth", "status"], text=True, capture_output=True, check=False)
-    if proc.returncode == 0:
-        print("GitHub CLI: autenticado")
-    else:
-        print("GitHub CLI: não autenticado ou token inválido")
-        if proc.stderr.strip():
-            print(proc.stderr.strip())
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(prog=APP, description="Backup/restauração de dotfiles via GitHub Gist")
-    parser.add_argument("--config-dir", type=Path, help=argparse.SUPPRESS)
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", help="Mostra configuração e data do backup")
-    setup = sub.add_parser("setup", help="Autentica e cria ou associa um Gist")
-    setup.add_argument("--gist", help="Associa um Gist existente pelo ID ou URL")
-    setup.add_argument("--yes", action="store_true", help="Confirma a criação do Gist")
-    manifest = sub.add_parser("manifest", help="Gerencia os arquivos incluídos no backup")
-    manifest_sub = manifest.add_subparsers(dest="action", required=True)
-    manifest_sub.add_parser("list", help="Lista os caminhos selecionados")
-    for action in ("add", "remove"):
-        item = manifest_sub.add_parser(action)
-        item.add_argument("path", help="Caminho dentro do HOME")
-    backup = sub.add_parser("backup", help="Atualiza o Gist com os arquivos selecionados")
-    backup.add_argument("--dry-run", action="store_true", help="Mostra o que seria enviado sem enviar")
-    restore = sub.add_parser("restore", help="Restaura os arquivos do Gist")
-    restore.add_argument("--gist", help="ID/URL de outro Gist")
-    restore.add_argument("--dry-run", action="store_true", help="Mostra o que seria restaurado")
-    restore.add_argument("--yes", action="store_true", help="Não pergunta antes de aplicar")
-    args = parser.parse_args()
-    config_dir = args.config_dir or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
-    try:
-        if args.command == "manifest":
-            cmd_manifest(args, config_dir)
-        elif args.command == "setup":
-            cmd_setup(args, config_dir)
-        elif args.command == "backup":
-            cmd_backup(args, config_dir)
-        elif args.command == "restore":
-            cmd_restore(args, config_dir)
-        else:
-            cmd_status(config_dir)
-    except AppError as exc:
-        print(f"Erro: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if (($# == 0)); then usage; exit 2; fi
+command="$1"; shift
+case "$command" in
+  status) dots_status "$@" ;;
+  setup) dots_setup "$@" ;;
+  manifest)
+    (($#)) || die "Informe uma ação para manifest: list, add ou remove."
+    action="$1"; shift
+    dots_manifest "$action" "$@"
+    ;;
+  backup) dots_backup "$@" ;;
+  restore) dots_restore "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "Comando desconhecido: $command" ;;
+esac
