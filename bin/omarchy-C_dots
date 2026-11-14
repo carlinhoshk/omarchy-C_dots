@@ -17,7 +17,7 @@ SCHEMA = 1
 MAX_FILE_SIZE = 1_000_000
 BLOCKED_PARTS = {
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
-    "credentials", "credential", "secrets", "secret", "tokens", "token",
+    "credentials", "credential", "secrets", "secret", "tokens", "token", "auth",
 }
 BLOCKED_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
 
@@ -72,6 +72,16 @@ def relative_home_path(raw: str) -> tuple[str, Path]:
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         candidate = home / candidate
+    lexical = Path(os.path.abspath(candidate))
+    try:
+        lexical_rel = lexical.relative_to(home)
+    except ValueError as exc:
+        raise AppError("O arquivo precisa estar dentro do seu HOME.") from exc
+    current = home
+    for part in lexical_rel.parts:
+        current /= part
+        if current.is_symlink():
+            raise AppError("Links simbólicos não são aceitos; informe o arquivo de destino explicitamente.")
     resolved = candidate.resolve(strict=False)
     try:
         rel = resolved.relative_to(home).as_posix()
@@ -80,8 +90,6 @@ def relative_home_path(raw: str) -> tuple[str, Path]:
     parts = {part.lower() for part in Path(rel).parts}
     if parts & BLOCKED_PARTS or Path(rel).suffix.lower() in BLOCKED_SUFFIXES:
         raise AppError("Este caminho parece conter credenciais ou dados sensíveis e foi bloqueado.")
-    if candidate.is_symlink():
-        raise AppError("Links simbólicos não são aceitos; informe o arquivo de destino explicitamente.")
     return rel, home / rel
 
 
@@ -235,9 +243,9 @@ def cmd_restore(args, config_dir: Path) -> None:
         if destination.is_symlink():
             raise AppError(f"Recusando sobrescrever link simbólico: ~/{rel}")
         if destination.exists():
-            backup = destination.with_name(destination.name + ".omarchy-C_dots.bak")
-            if not backup.exists():
-                backup.write_bytes(destination.read_bytes())
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            backup = destination.with_name(destination.name + f".omarchy-C_dots.bak.{stamp}")
+            backup.write_bytes(destination.read_bytes())
         destination.write_text(content, encoding="utf-8")
         print(f"Restaurado: ~/{rel}")
 
