@@ -25,6 +25,7 @@ dots_restore() {
   [[ -s "$payload" ]] || die "O Gist não contém $GIST_FILENAME."
   jq -e '.schema == 1 and (.files | type == "object") and all(.files[]; type == "string")' "$payload" >/dev/null \
     || die "O conteúdo do Gist não corresponde a um backup válido."
+  [[ "$(jq '.files | length' "$payload")" -gt 0 ]] || die "O backup no Gist não contém arquivos."
 
   printf 'Arquivos no backup (%s):\n' "$(jq '.files | length' "$payload")"
   while IFS= read -r -d '' rel; do
